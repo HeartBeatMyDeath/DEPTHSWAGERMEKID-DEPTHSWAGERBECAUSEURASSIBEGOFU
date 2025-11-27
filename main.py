@@ -1,7 +1,7 @@
 import discord
 from discord.ext import commands
 from discord import app_commands
-from discord.ui import View, Button, Modal, TextInput
+from discord.ui import View, Button, Modal, TextInput, Select
 from dotenv import load_dotenv
 import webserver
 import os
@@ -9,6 +9,8 @@ from datetime import timedelta, datetime, timezone
 import json
 import re
 import asyncio
+import aiohttp
+import io
 
 # ----------------------------
 # Load token and setup intents[
@@ -28,13 +30,17 @@ BLACKLIST_CHANNEL_ID = 1385956899752509532
 BLACKLIST_MESSAGE_ID = 1438983885517099112
 MOD_LOG_CHANNEL_ID = 1438981968380301403  # channel used for persistent mod logs
 
+
+
+
 PERMISSION_TIERS = {
-    1362889706563440900: ["kick", "ban", "timeout", "log", "warn", "warnlog", "warndelete", "blacklist_interface"], #owner
+    1362889706563440900: ["kick", "ban", "timeout", "log", "warn", "warnlog", "warndelete", "blacklist_interface", "panel"], #owner
     1362896066504036402: ["kick", "ban", "timeout", "log", "warn", "warnlog", "warndelete"], #co owner
     1399809075252039824: ["kick", "ban", "timeout", "log", "warn", "warnlog", "warndelete"], # senior
     1391861560967954483: ["kick", "ban", "timeout", "log", "warn", "warnlog", "warndelete"], # mod
     1431713725362212917: ["blacklist_interface"], #blacklister
     1399808293999738961: ["kick", "timeout", "log", "warn", "warnlog", "warndelete"], #junior
+    1440250118946164816: ["timeout", "warn", "warnlog", "warndelete", "log"], #trial
 }
 
 # ----------------------------
@@ -477,8 +483,180 @@ async def log(interaction: discord.Interaction, member: discord.Member):
     await run_command_with_permission(interaction, "log", func, member)
 
 # ----------------------------
+# ----------------------------
+#  CONTROL PANEL (Owner-only)
+# ----------------------------
+# ----------------------------
+class ChannelSelect(Select):
+    def __init__(self):
+        super().__init__(placeholder="Select a text channel...", min_values=1, max_values=1, options=[])
+
+    async def callback(self, interaction: discord.Interaction):
+        # value is channel id as str
+        channel_id = int(self.values[0])
+        channel = interaction.guild.get_channel(channel_id)
+        if channel is None:
+            await interaction.response.send_message("❌ Invalid channel selected.", ephemeral=True)
+            return
+
+        view = ChannelActions(channel, interaction.user.id)
+        await interaction.response.send_message(f"🛠 Control panel for <#{channel_id}>", view=view, ephemeral=True)
+
+class ControlPanelView(View):
+    def __init__(self, user_id):
+        super().__init__(timeout=300)
+        self.user_id = user_id
+        self.add_item(ChannelSelect())
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        return interaction.user.id == self.user_id
+
+class MessageModal(Modal, title="Send Message as Bot"):
+    message = TextInput(label="Message", style=discord.TextStyle.paragraph, required=True, max_length=2000)
+    def __init__(self, channel: discord.TextChannel):
+        super().__init__()
+        self.channel = channel
+    async def on_submit(self, interaction: discord.Interaction):
+        try:
+            await self.channel.send(self.message.value)
+            await interaction.response.send_message("✅ Message sent!", ephemeral=True)
+        except discord.Forbidden:
+            await interaction.response.send_message("❌ Bot lacks permission to send messages in that channel.", ephemeral=True)
+        except Exception as e:
+            await interaction.response.send_message(f"❌ Error: {e}", ephemeral=True)
+
+class EmbedModal(Modal, title="Create Embed"):
+    title_field = TextInput(label="Title", required=False, max_length=256)
+    desc_field = TextInput(label="Description", style=discord.TextStyle.paragraph, required=False, max_length=4000)
+    color_field = TextInput(label="Color (hex, e.g. ff8800) or empty", required=False, max_length=6, placeholder="ff8800")
+    thumbnail_field = TextInput(label="Thumbnail URL (optional)", required=False)
+    image_field = TextInput(label="Image URL (optional)", required=False)
+    footer_field = TextInput(label="Footer Text (optional)", required=False)
+    timestamp_field = TextInput(label="Add timestamp? (yes/no)", required=False, placeholder="yes")
+
+    def __init__(self, channel: discord.TextChannel):
+        super().__init__()
+        self.channel = channel
+
+    async def on_submit(self, interaction: discord.Interaction):
+        color = None
+        if self.color_field.value:
+            try:
+                color = discord.Color(int(self.color_field.value.strip(), 16))
+            except Exception:
+                color = None
+        embed = discord.Embed(
+            title=self.title_field.value or None,
+            description=self.desc_field.value or None,
+            color=color or discord.Color.default()
+        )
+        if self.thumbnail_field.value:
+            embed.set_thumbnail(url=self.thumbnail_field.value.strip())
+        if self.image_field.value:
+            embed.set_image(url=self.image_field.value.strip())
+        if self.footer_field.value:
+            embed.set_footer(text=self.footer_field.value.strip())
+        if self.timestamp_field.value and self.timestamp_field.value.lower().startswith("y"):
+            embed.timestamp = datetime.now(timezone.utc)
+        try:
+            await self.channel.send(embed=embed)
+            await interaction.response.send_message("✅ Embed sent!", ephemeral=True)
+        except discord.Forbidden:
+            await interaction.response.send_message("❌ Bot lacks permission to send embeds in that channel.", ephemeral=True)
+        except Exception as e:
+            await interaction.response.send_message(f"❌ Error: {e}", ephemeral=True)
+
+class AttachmentModal(Modal, title="Send Attachment (via file URL)"):
+    file_url = TextInput(label="File URL (http/https)", required=True)
+    filename = TextInput(label="Filename to save as (optional)", required=False, placeholder="example.png")
+
+    def __init__(self, channel: discord.TextChannel):
+        super().__init__()
+        self.channel = channel
+
+    async def on_submit(self, interaction: discord.Interaction):
+        url = self.file_url.value.strip()
+        fname = (self.filename.value.strip() or None) if self.filename.value else None
+        if not url.lower().startswith(("http://", "https://")):
+            await interaction.response.send_message("❌ URL must start with http:// or https://", ephemeral=True)
+            return
+        await interaction.response.defer(ephemeral=True)
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(url) as resp:
+                    if resp.status != 200:
+                        await interaction.followup.send(f"❌ Failed to download file: HTTP {resp.status}", ephemeral=True)
+                        return
+                    data = await resp.read()
+            fp = io.BytesIO(data)
+            # choose filename
+            if not fname:
+                # try to infer from URL
+                fname = url.split("/")[-1].split("?")[0] or "file"
+            fp.seek(0)
+            discord_file = discord.File(fp, filename=fname)
+            await self.channel.send(file=discord_file)
+            await interaction.followup.send("✅ Attachment sent!", ephemeral=True)
+        except discord.Forbidden:
+            await interaction.followup.send("❌ Bot lacks permission to send attachments in that channel.", ephemeral=True)
+        except Exception as e:
+            await interaction.followup.send(f"❌ Error sending attachment: {e}", ephemeral=True)
+
+# ----------------------------
+# ChannelActions (fixed, no duplicate buttons)
+# ----------------------------
+class ChannelActions(View):
+    def __init__(self, channel: discord.TextChannel, user_id: int):
+        super().__init__(timeout=300)
+        self.channel = channel
+        self.user_id = user_id
+
+        # Buttons with callbacks
+        self.msg_button = Button(label="Send Message", style=discord.ButtonStyle.primary)
+        self.msg_button.callback = self.send_message
+        self.add_item(self.msg_button)
+
+
+
+        self.attach_button = Button(label="Send Attachment (URL)", style=discord.ButtonStyle.secondary)
+        self.attach_button.callback = self.send_attachment
+        self.add_item(self.attach_button)
+
+    async def interaction_check(self, interaction: discord.Interaction) -> bool:
+        # Ensure only the user who opened the panel can interact
+        return interaction.user.id == self.user_id
+
+    # Button callbacks
+    async def send_message(self, interaction: discord.Interaction):
+        await interaction.response.send_modal(MessageModal(self.channel))
+
+   
+
+    async def send_attachment(self, interaction: discord.Interaction):
+        await interaction.response.send_modal(AttachmentModal(self.channel))
+
+
+# ----------------------------
+# /panel command (unchanged)
+# ----------------------------
+@bot.tree.command(name="panel", description="Open the bot control panel", guild=discord.Object(id=GUILD_ID))
+async def panel(interaction: discord.Interaction):
+    view = ControlPanelView(interaction.user.id)
+
+    # populate channel select with all text channels
+    select: ChannelSelect = view.children[0]  # type: ignore
+    for ch in interaction.guild.text_channels:
+        select.options.append(discord.SelectOption(label=f"#{ch.name}", value=str(ch.id)))
+
+    await interaction.response.send_message(
+        "🛠 Bot Control Panel — choose a channel",
+        view=view,
+        ephemeral=True
+    )
+
+
+# ----------------------------
 # Run the bot
 # ----------------------------
 webserver.keep_alive()
 bot.run(token)
-
