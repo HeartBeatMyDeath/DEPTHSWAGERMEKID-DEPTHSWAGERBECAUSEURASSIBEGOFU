@@ -641,18 +641,25 @@ class ChannelActions(View):
 # ----------------------------
 @bot.tree.command(name="panel", description="Open the bot control panel", guild=discord.Object(id=GUILD_ID))
 async def panel(interaction: discord.Interaction):
-    view = ControlPanelView(interaction.user.id)
+    text_channels = [ch for ch in interaction.guild.text_channels if ch.permissions_for(interaction.user).view_channel]
+    if not text_channels:
+        await interaction.response.send_message("❌ No accessible text channels found.", ephemeral=True)
+        return
 
-    # populate channel select with all text channels
-    select: ChannelSelect = view.children[0]  # type: ignore
-    for ch in interaction.guild.text_channels:
+    view = View(timeout=300)
+
+    # create select with options
+    select = ChannelSelect()
+    for ch in text_channels[:25]:  # Discord limit
         select.options.append(discord.SelectOption(label=f"#{ch.name}", value=str(ch.id)))
+    view.add_item(select)
 
     await interaction.response.send_message(
         "🛠 Bot Control Panel — choose a channel",
         view=view,
         ephemeral=True
     )
+
 
 
 # ----------------------------
